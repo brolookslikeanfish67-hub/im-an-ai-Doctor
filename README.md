@@ -2,7 +2,7 @@
 <p align="center">
 
 
-DISCLAIMER - Do not take any advice from Doctor Dignity seriously yet. This is a work in progress and taking any advice seriously could result in serious injury or even death. 
+DISCLAIMER - Do not take any advice from IM AN AI Doctor  seriously yet. This is a work in progress and taking any advice seriously could result in serious injury or even death. 
 
 <img src="https://i.imgur.com/18jVWiV.png" width="400" height="400">
 </p>
