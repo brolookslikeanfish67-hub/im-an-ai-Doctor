@@ -1,19 +1,15 @@
+import argparse
+import json
+import os
 from typing import List
 
-import argparse
-import os
-import json
-
-import tvm
-from tvm import relax
-from tvm import rpc
-from tvm.relax.testing.lib_comparator import LibCompareVMInstrument
 import numpy as np
-
 import torch
-from transformers import AutoTokenizer, LlamaTokenizer
-
+import tvm
 from mlc_llm import utils
+from transformers import AutoTokenizer, LlamaTokenizer
+from tvm import relax, rpc
+from tvm.relax.testing.lib_comparator import LibCompareVMInstrument
 
 
 class LibCompare(LibCompareVMInstrument):
@@ -21,7 +17,7 @@ class LibCompare(LibCompareVMInstrument):
         super().__init__(mod, device, True)
         self.time_eval = time_eval
         self.time_eval_results = {}
-        self.visited = set([])
+        self.visited = set()
         self.skip_rounds = skip_rounds
         self.atol = 1e-2
         self.rtol = 1e-3
@@ -53,34 +49,39 @@ class LibCompare(LibCompareVMInstrument):
 
         if self.time_eval and name not in self.time_eval_results:
             res = self.mod.time_evaluator(
-                name, self.device, number=20, repeat=3#, cache_flush_bytes=256 * 10**6
+                name, self.device, number=20, repeat=3
             )(*new_args)
             self.time_eval_results[name] = (res.mean, 1)
             print(f"Time-eval result {name} on {self.device}: {res}")
 
 
 def print_as_table(sorted_list):
+    if not sorted_list:
+        print("No profiling results to display.\n")
+        return
+
+    # Header using modern alignment
     print(
-        "Name".ljust(50)
-        + "Time (ms)".ljust(12)
-        + "Count".ljust(8)
-        + "Total time (ms)".ljust(18)
-        + "Percentage (%)"
+        f"{'Name':<50}{'Time (ms)':<12}{'Count':<8}{'Total time (ms)':<18}{'Percentage (%)'}"
     )
-    total_time = sum([record[1][0] * record[1][1] for record in sorted_list]) * 1000
+    
+    total_time = sum(record[1][0] * record[1][1] for record in sorted_list) * 1000
+    if total_time == 0:
+        return
+
     for record in sorted_list:
-        time = record[1][0] * 1000
-        weighted_time = time * record[1][1]
-        percentage = weighted_time / total_time * 100
+        time_ms = record[1][0] * 1000
+        weighted_time = time_ms * record[1][1]
+        percentage = (weighted_time / total_time) * 100
+        
         print(
-            record[0].ljust(50)
-            + "{:.4f}".format(time).ljust(12)
-            + str(record[1][1]).ljust(8)
-            + "{:.4f}".format(weighted_time).ljust(18)
-            + "{:.2f}".format(percentage)
+            f"{record[0]:<50}"
+            f"{time_ms:<12.4f}"
+            f"{str(record[1][1]):<8}"
+            f"{weighted_time:<18.4f}"
+            f"{percentage:.2f}"
         )
-    print("Total time: {:.4f} ms".format(total_time))
-    print()
+    print(f"Total time: {total_time:.4f} ms\n")
 
 
 class TestState:
@@ -93,6 +94,8 @@ class TestState:
             )
         )
         self.vm = relax.VirtualMachine(ex, self.primary_device)
+        
+        # Cross-compilation target setup
         if args.cmp_device == "iphone":
             lib_name = f"{args.model}-{args.quantization.name}-{args.cmp_device}.dylib"
             local_lib_path = os.path.join(args.artifact_path, lib_name)
@@ -121,9 +124,7 @@ class TestState:
                 )
             )
             self.cmp_device = tvm.device(args.cmp_device)
-        self.const_params_dict = utils.load_params(
-            args.artifact_path, self.primary_device
-        )
+
         self.cmp_instrument = LibCompare(
             self.lib,
             self.cmp_device,
@@ -134,23 +135,19 @@ class TestState:
 
 
 def deploy_to_pipeline(args) -> None:
-    with open(
-        os.path.join(args.artifact_path, "params", "mlc-chat-config.json"), "r"
-    ) as f:
+    config_path = os.path.join(args.artifact_path, "params", "mlc-chat-config.json")
+    with open(config_path, "r") as f:
         config = json.load(f)
 
     primary_device = tvm.device(args.primary_device)
     const_params = utils.load_params(args.artifact_path, primary_device)
     state = TestState(args)
 
-    if config["model_category"] == "llama":
-        tokenizer = LlamaTokenizer.from_pretrained(
-            os.path.join(args.artifact_path, "params"), trust_remote_code=True
-        )
+    tokenizer_path = os.path.join(args.artifact_path, "params")
+    if config.get("model_category") == "llama":
+        tokenizer = LlamaTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
     else:
-        tokenizer = AutoTokenizer.from_pretrained(
-            os.path.join(args.artifact_path, "params"), trust_remote_code=True
-        )
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
 
     print("Tokenizing...")
     inputs = tvm.nd.array(
@@ -158,7 +155,7 @@ def deploy_to_pipeline(args) -> None:
         primary_device,
     )
     first_sampled_token = tvm.nd.array(
-        np.array([[6234]]).astype("int32"), primary_device
+        np.array([[6234]], dtype="int32"), primary_device
     )
     seq_len_shape = tvm.runtime.ShapeTuple([inputs.shape[1]])
     second_seq_len_shape = tvm.runtime.ShapeTuple([inputs.shape[1] + 1])
@@ -177,6 +174,7 @@ def deploy_to_pipeline(args) -> None:
     )
     state.cmp_instrument.time_eval_results.clear()
     state.cmp_instrument.visited.clear()
+    
     print("======================= Starts Decoding =======================")
     logits, kv_caches = state.vm["decode"](
         first_sampled_token, second_seq_len_shape, kv_caches, const_params
@@ -191,15 +189,16 @@ def deploy_to_pipeline(args) -> None:
 
 
 def _parse_args():
-    args = argparse.ArgumentParser()
-    args.add_argument("--local-id", type=str, required=True)
-    args.add_argument("--artifact-path", type=str, default="dist")
-    args.add_argument("--primary-device", type=str, default="auto")
-    args.add_argument("--cmp-device", type=str, required=True)
-    args.add_argument("--prompt", type=str, default="The capital of Canada is")
-    args.add_argument("--time-eval", default=False, action="store_true")
-    args.add_argument("--skip-rounds", type=int, default=0)
-    parsed = args.parse_args()
+    parser = argparse.ArgumentParser(description="Cross-Device Layer-by-Layer Verification")
+    parser.add_argument("--local-id", type=str, required=True)
+    parser.add_argument("--artifact-path", type=str, default="dist")
+    parser.add_argument("--primary-device", type=str, default="auto")
+    parser.add_argument("--cmp-device", type=str, required=True)
+    parser.add_argument("--prompt", type=str, default="The capital of Canada is")
+    parser.add_argument("--time-eval", default=False, action="store_true")
+    parser.add_argument("--skip-rounds", type=int, default=0)
+    
+    parsed = parser.parse_args()
     parsed.model, parsed.quantization = parsed.local_id.rsplit("-", 1)
     utils.argparse_postproc_common(parsed)
 
@@ -215,7 +214,7 @@ def _parse_args():
         elif tvm.rocm().exist:
             parsed.primary_device = "rocm"
         else:
-            raise ValueError("Cannot auto deduce device-name, please set it")
+            raise ValueError("Cannot auto-deduce baseline device. Please set --primary-device explicitly.")
     return parsed
 
 
