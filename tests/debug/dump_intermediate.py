@@ -1,13 +1,10 @@
 import argparse
 import os
-
 import numpy as np
 import torch
 import tvm
-from transformers import AutoTokenizer
 from tvm import relax
-import pickle
-
+from transformers import AutoTokenizer
 from mlc_llm import utils
 
 
@@ -17,53 +14,52 @@ class DumpInstrument:
         self.counter = 0
 
     def __call__(self, func, name, before_run, ret_val, *args):
-        if before_run:
-            return
-        if name.startswith("vm.builtin."):
+        if before_run or name.startswith("vm.builtin."):
             return
         if any(not isinstance(x, tvm.nd.NDArray) for x in args):
             return
 
-        print(f"[{self.counter}][{name}]")
-        print(args[-1])
+        if self.verbose:
+            print(f"[{self.counter}][{name}]")
+            print(args[-1])
         self.counter += 1
 
 
 def print_as_table(sorted_list):
+    # Header
     print(
-        "Name".ljust(50)
-        + "Time (ms)".ljust(12)
-        + "Count".ljust(8)
-        + "Total time (ms)".ljust(18)
-        + "Percentage (%)"
+        f"{'Name':<50}{'Time (ms)':<12}{'Count':<8}{'Total time (ms)':<18}{'Percentage (%)'}"
     )
-    total_time = sum([record[1][0] * record[1][1] for record in sorted_list]) * 1000
+    
+    total_time = sum(record[1][0] * record[1][1] for record in sorted_list) * 1000
+    if total_time == 0:
+        return
+
     for record in sorted_list:
-        time = record[1][0] * 1000
-        weighted_time = time * record[1][1]
-        percentage = weighted_time / total_time * 100
+        time_ms = record[1][0] * 1000
+        weighted_time = time_ms * record[1][1]
+        percentage = (weighted_time / total_time) * 100
+        
         print(
-            record[0].ljust(50)
-            + "{:.4f}".format(time).ljust(12)
-            + str(record[1][1]).ljust(8)
-            + "{:.4f}".format(weighted_time).ljust(18)
-            + "{:.2f}".format(percentage)
+            f"{record[0]:<50}"
+            f"{time_ms:<12.4f}"
+            f"{str(record[1][1]):<8}"
+            f"{weighted_time:<18.4f}"
+            f"{percentage:.2f}"
         )
-    print("Total time: {:.4f} ms".format(total_time))
-    print()
+    print(f"Total time: {total_time:.4f} ms\n")
 
 
 class TestState:
     def __init__(self, args):
         self.primary_device = tvm.device(args.primary_device)
-        ex = tvm.runtime.load_module(
-            os.path.join(
-                args.artifact_path,
-                f"{args.model}-{args.quantization.name}-{args.primary_device}.so",
-            )
+        model_path = os.path.join(
+            args.artifact_path,
+            f"{args.model}-{args.quantization.name}-{args.primary_device}.so",
         )
+        
+        ex = tvm.runtime.load_module(model_path)
         self.vm = relax.VirtualMachine(ex, self.primary_device)
-        self.sess = None
         self.instrument = DumpInstrument(verbose=True)
         self.vm.set_instrument(self.instrument)
 
@@ -72,54 +68,53 @@ def deploy_to_pipeline(args) -> None:
     primary_device = tvm.device(args.primary_device)
     const_params = utils.load_params(args.artifact_path, primary_device)
     state = TestState(args)
-    tokenizer = AutoTokenizer.from_pretrained(
-        os.path.join(args.artifact_path, "params"), trust_remote_code=True
-    )
+    
+    tokenizer_path = os.path.join(args.artifact_path, "params")
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
 
     print("Tokenizing...")
-    inputs = (
-        tokenizer(args.prompt, return_tensors="pt").input_ids.to(torch.int32).numpy()
-    )
-    first_sampled_token = tvm.nd.array(
-        np.array([[6234]]).astype("int32"), primary_device
-    )
-    seq_len_shape = tvm.runtime.ShapeTuple([inputs.shape[1]])
-    second_seq_len_shape = tvm.runtime.ShapeTuple([inputs.shape[1] + 1])
+    inputs = tokenizer(args.prompt, return_tensors="pt").input_ids.to(torch.int32).numpy()
+    
+    first_sampled_token = tvm.nd.array(np.array([[6234]], dtype="int32"), primary_device)
+    
     kv_caches = state.vm["create_kv_cache"]()
 
     print("Running inference...")
     print("======================= Starts Encoding =======================")
 
-    try:
-        prefill_func = state.vm["prefill"]
-    except AttributeError:
-        prefill_func = None
+    # Clean check if prefill exists in VM targets
+    has_prefill = "prefill" in [f.name_hint for f in state.vm.module.functions]
 
-    if inputs.shape[1] > 1 and prefill_func:
-        inputs = tvm.nd.array(inputs, device=primary_device)
-        logits, kv_caches = prefill_func(inputs, seq_len_shape, kv_caches, const_params)
+    if inputs.shape[1] > 1 and has_prefill:
+        inputs_nd = tvm.nd.array(inputs, device=primary_device)
+        seq_len_shape = tvm.runtime.ShapeTuple([inputs.shape[1]])
+        logits, kv_caches = state.vm["prefill"](inputs_nd, seq_len_shape, kv_caches, const_params)
     else:
+        # Fallback block processing sequence token by token
         for i in range(inputs.shape[1]):
             input_slice = tvm.nd.array(inputs[:, i : i + 1], device=primary_device)
+            slice_shape = tvm.runtime.ShapeTuple([i + 1])
             logits, kv_caches = state.vm["decode"](
-                input_slice, seq_len_shape, kv_caches, const_params
+                input_slice, slice_shape, kv_caches, const_params
             )
 
     print("======================= Starts Decoding =======================")
+    second_seq_len_shape = tvm.runtime.ShapeTuple([inputs.shape[1] + 1])
     logits, kv_caches = state.vm["decode"](
         first_sampled_token, second_seq_len_shape, kv_caches, const_params
     )
 
 
 def _parse_args():
-    args = argparse.ArgumentParser()
-    args.add_argument("--local-id", type=str, required=True)
-    args.add_argument("--artifact-path", type=str, default="dist")
-    args.add_argument("--primary-device", type=str, default="auto")
-    args.add_argument("--prompt", type=str, default="The capital of Canada is")
-    args.add_argument("--time-eval", default=False, action="store_true")
-    args.add_argument("--skip-rounds", type=int, default=0)
-    parsed = args.parse_args()
+    parser = argparse.ArgumentParser(description="MLC-LLM Pipeline Runner")
+    parser.add_argument("--local-id", type=str, required=True)
+    parser.add_argument("--artifact-path", type=str, default="dist")
+    parser.add_argument("--primary-device", type=str, default="auto")
+    parser.add_argument("--prompt", type=str, default="The capital of Canada is")
+    parser.add_argument("--time-eval", default=False, action="store_true")
+    parser.add_argument("--skip-rounds", type=int, default=0)
+    
+    parsed = parser.parse_args()
     parsed.model, parsed.quantization = parsed.local_id.rsplit("-", 1)
     utils.argparse_postproc_common(parsed)
 
@@ -133,7 +128,8 @@ def _parse_args():
         elif tvm.metal().exist:
             parsed.primary_device = "metal"
         else:
-            raise ValueError("Cannot auto deduce device-name, please set it")
+            raise ValueError("Cannot auto-deduce target hardware device context. Please set --primary-device manually.")
+            
     return parsed
 
 
