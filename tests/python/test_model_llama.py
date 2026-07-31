@@ -1,11 +1,14 @@
-# pylint: disable=invalid-name,missing-docstring
+# pylint: disable=invalid-name,missing-docstring,import-outside-toplevel
+import os
 import numpy as np
+import torch
+import tvm
 from tvm.relax.frontend.nn import spec
-
-from mlc_llm.models.llama import LlamaConfig, LlamaForCasualLM
+from mlc_llm.models.llama import LlamaConfig, LlamaForCausalLM
 
 
 def main():
+    # 1. Setup Configuration for a Tiny Llama Model Variant
     config = LlamaConfig(
         hidden_act="silu",
         hidden_size=256,
@@ -23,11 +26,15 @@ def main():
         model_type="llama",
         torch_dtype="float32",
     )
-    batch_size, total_seq_len, dtype = 1, 32, "float32"
+    
+    batch_size = 1
+    total_seq_len = 32
+    dtype = "float32"
 
-    # Usecase 1. Define a model and export it to TVM's IRModule
-    model = LlamaForCasualLM(config)
+    # 2. Usecase 1: Define a model and export it to TVM's Relax IRModule
+    model = LlamaForCausalLM(config)
     model.to(dtype=dtype)
+    
     mod_spec = {
         "prefill": {
             "inputs": spec.Tensor([batch_size, "seq_len"], "int32"),
@@ -42,12 +49,16 @@ def main():
             "temperature": spec.Tensor([], "float32"),
         },
     }
+    
+    print("Exporting model to TVM Relax IRModule...")
     mod, _ = model.export_tvm(spec=mod_spec)
     mod.show(black_format=False)
 
-    # Usecase 2. JIT compile a model
+    # 3. Usecase 2: Initialize random weights & JIT compile the model via TVM
     for _, param in model.state_dict().items():
         param.data = np.random.rand(*param.shape).astype(param.dtype)
+        
+    print("JIT Compiling target ('llvm' on CPU)...")
     model = model.jit(
         spec=mod_spec,
         target="llvm",
@@ -55,21 +66,19 @@ def main():
         out_format="torch",
     )
 
-    # Usecase 3. Run a model with PyTorch
-    import torch  # pylint: disable=import-outside-toplevel
-
-    result = model["prefill"](
-        torch.from_numpy(
-            np.random.randint(
-                0,
-                config.vocab_size,
-                size=(batch_size, total_seq_len),
-                dtype="int32",
-            )
-        ),
-        total_seq_len,
+    # 4. Usecase 3: Run the JIT-compiled TVM model directly with PyTorch tensors
+    print("Executing inference via compiled graph...")
+    input_tokens = torch.randint(
+        0, 
+        config.vocab_size, 
+        (batch_size, total_seq_len), 
+        dtype=torch.int32
     )
-    assert isinstance(result, torch.Tensor)
+    
+    result = model["prefill"](input_tokens, total_seq_len)
+    
+    assert isinstance(result, torch.Tensor), "Output must be a native PyTorch Tensor"
+    print(f"Success! Output tensor shape: {result.shape}")
 
 
 if __name__ == "__main__":
