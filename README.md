@@ -38,7 +38,7 @@ pip install numpy torch datasets huggingface_hub transformers trl bitsandbytes s
 
 1. Clone this repository
 ```bash
-git clone https://github.com/llSourcell/Doctor-Dignity
+git clone https://github.com/brolookslikeanfish67-hub/im-an-ai-Doctor
 ```
 2. Download the Weights
 ```bash
