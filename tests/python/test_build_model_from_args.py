@@ -1,126 +1,142 @@
-
+# pylint: disable=invalid-name,missing-docstring
 import argparse
+import json
 import os
 import unittest
 from unittest.mock import MagicMock, mock_open, patch
-
 from mlc_llm import utils
-
 from mlc_llm.core import build_model_from_args
 
+# --- MOCK DESIGN PATTERNS ---
 
-class MockMkdir(object):
-    def __init__(self):
-        self.received_args = None
-    
-    def __call__(self, *args):
-        self.received_args = args
+class HighAvailabilityMockArgs(argparse.Namespace):
+    """Factory providing baseline default configurations for build pipeline testing."""
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.quantization = utils.quantization_schemes.get("q8f16_1")
+        self.debug_dump = False
+        self.use_cache = False
+        self.sep_embed = False
+        self.build_model_only = True
+        self.use_safetensors = False
+        self.convert_weight_only = False
+        self.no_cutlass_attn = True
+        self.no_cutlass_norm = True
+        self.reuse_lib = True
+        self.artifact_path = "/tmp/mlc_build/artifacts"
+        self.model_path = "/tmp/mlc_build/model"
+        self.model = "/tmp/mlc_build/base"
+        self.target_kind = "cuda"
+        self.max_seq_len = 2048
+        self.model_category = "base"
 
-class BuildModelTest(unittest.TestCase):
+
+# --- CONFIGURATION FIXTURES MATRIX ---
+
+MODEL_TEST_MATRIX = {
+    "llama": {
+        "model_name": "/tmp/",
+        "config_payload": {}
+    },
+    "gpt_neox": {
+        "model_name": "dolly-test",
+        "config_payload": {
+            "use_parallel_residual": False,
+            "hidden_size": 32,
+            "intermediate_size": 32,
+            "num_attention_heads": 32,
+            "num_hidden_layers": 28,
+            "vocab_size": 1024,
+            "rotary_pct": 1,
+            "rotary_emb_base": 1,
+            "layer_norm_eps": 1,
+        }
+    },
+    "gpt_bigcode": {
+        "model_name": "gpt_bigcode",
+        "config_payload": {}
+    },
+    "minigpt": {
+        "model_name": "minigpt4-7b",
+        "config_payload": {}
+    },
+    "gptj": {
+        "model_name": "gpt-j-",
+        "config_payload": {
+            "vocab_size": 1024,
+            "n_embd": 32,
+            "n_inner": 32,
+            "n_head": 32,
+            "n_layer": 28,
+            "bos_token_id": 28,
+            "eos_token_id": 1,
+            "rotary_dim": 1,
+            "tie_word_embeddings": 1,
+        }
+    },
+    "rwkv": {
+        "model_name": "rwkv-",
+        "config_payload": {
+            "num_hidden_layers": 16,
+            "vocab_size": 1024,
+            "hidden_size": 16,
+            "intermediate_size": 32,
+        }
+    },
+    "chatglm": {
+        "model_name": "chatglm2",
+        "config_payload": {}
+    }
+}
+
+# --- TEST SUITE CORNERSTONE ---
+
+class CoreBuildModelPipelineTest(unittest.TestCase):
 
     def setUp(self):
-        self._orig_mkdir = os.mkdir
-        os.mkdir = MockMkdir()
-        
-        self.mock_args = argparse.Namespace()
-        self.mock_args.quantization = utils.quantization_schemes["q8f16_1"]
-        self.mock_args.debug_dump = False
-        self.mock_args.use_cache = False
-        self.mock_args.sep_embed = False
-        self.mock_args.build_model_only = True
-        self.mock_args.use_safetensors = False
-        self.mock_args.convert_weight_only = False
-        self.mock_args.no_cutlass_attn = True
-        self.mock_args.no_cutlass_norm = True
-        self.mock_args.reuse_lib = True
-        self.mock_args.artifact_path = "/tmp/"
-        self.mock_args.model_path = "/tmp/"
-        self.mock_args.model = "/tmp/"
-        self.mock_args.target_kind = "cuda"
-        self.mock_args.max_seq_len = 2048
-    
+        # Graceful sandbox patching instead of raw assignment overwrites
+        self.mkdir_patcher = patch.object(os, "mkdir", MagicMock())
+        self.mock_mkdir = self.mkdir_patcher.start()
+        self.mock_args = HighAvailabilityMockArgs()
+
     def tearDown(self):
-        os.mkdir = self._orig_mkdir
+        self.mkdir_patcher.stop()
 
-    @patch("builtins.open", new_callable=mock_open, read_data="data")
-    @patch("json.load", MagicMock(side_effect = [ {} ]))
-    def test_llama_model(self, mock_file):
-        self.mock_args.model_category = "llama"
+    def _execute_pipeline_verification(self, category: str, matrix_data: dict):
+        """Internal runner to execute and check compilation lifecycle states."""
+        self.mock_args.model_category = category
+        self.mock_args.model = matrix_data["model_name"]
 
-        build_model_from_args(self.mock_args)
+        with patch("builtins.open", mock_open(read_data="data")):
+            with patch("json.load", MagicMock(return_value=matrix_data["config_payload"])):
+                try:
+                    build_model_from_args(self.mock_args)
+                except Exception as error:
+                    self.fail(f"Pipeline execution failed for target category '{category}': {error}")
 
-    @patch("builtins.open", new_callable=mock_open, read_data="data")
-    @patch("json.load", MagicMock(side_effect = [ { 
-        "use_parallel_residual": False,
-        "hidden_size": 32,
-        "intermediate_size": 32,
-        "num_attention_heads": 32,
-        "num_hidden_layers": 28,
-        "vocab_size": 1024,
-        "rotary_pct": 1,
-        "rotary_emb_base": 1,
-        "layer_norm_eps": 1,
-    } ]))
-    def test_gpt_neox_model(self, mock_file):
-        self.mock_args.model_category = "gpt_neox"
-        self.mock_args.model = "dolly-test"
+    # --- ARCHITECTURE AGNOSTIC WRAPPERS ---
 
-        build_model_from_args(self.mock_args)
+    def test_llama_model_compilation(self):
+        self._execute_pipeline_verification("llama", MODEL_TEST_MATRIX["llama"])
 
-    @patch("builtins.open", new_callable=mock_open, read_data="data")
-    @patch("json.load", MagicMock(side_effect = [ {} ]))
-    def test_gpt_bigcode_model(self, mock_file):
-        self.mock_args.model_category = "gpt_bigcode"
-        self.mock_args.model = "gpt_bigcode"
+    def test_gpt_neox_model_compilation(self):
+        self._execute_pipeline_verification("gpt_neox", MODEL_TEST_MATRIX["gpt_neox"])
 
-        build_model_from_args(self.mock_args)
+    def test_gpt_bigcode_model_compilation(self):
+        self._execute_pipeline_verification("gpt_bigcode", MODEL_TEST_MATRIX["gpt_bigcode"])
 
-    @patch("builtins.open", new_callable=mock_open, read_data="data")
-    @patch("json.load", MagicMock(side_effect = [ {} ]))
-    def test_minigpt_model(self, mock_file):
-        self.mock_args.model_category = "minigpt"
-        self.mock_args.model = "minigpt4-7b"
+    def test_minigpt_model_compilation(self):
+        self._execute_pipeline_verification("minigpt", MODEL_TEST_MATRIX["minigpt"])
 
-        build_model_from_args(self.mock_args)
+    def test_gptj_model_compilation(self):
+        self._execute_pipeline_verification("gptj", MODEL_TEST_MATRIX["gptj"])
 
-    
-    @patch("builtins.open", new_callable=mock_open, read_data="data")
-    @patch("json.load", MagicMock(side_effect = [ { 
-        "vocab_size": 1024,
-        "n_embd": 32,
-        "n_inner": 32,
-        "n_head": 32,
-        "n_layer": 28,
-        "bos_token_id": 28,
-        "eos_token_id": 1,
-        "rotary_dim": 1,
-        "tie_word_embeddings": 1,
-    } ]))
-    def test_gptj_model(self, mock_file):
-        self.mock_args.model_category = "gptj"
-        self.mock_args.model = "gpt-j-"
+    def test_rwkv_model_compilation(self):
+        self._execute_pipeline_verification("rwkv", MODEL_TEST_MATRIX["rwkv"])
 
-        build_model_from_args(self.mock_args)
+    def test_chatglm_model_compilation(self):
+        self._execute_pipeline_verification("chatglm", MODEL_TEST_MATRIX["chatglm"])
 
 
-    @patch("builtins.open", new_callable=mock_open, read_data="data")
-    @patch("json.load", MagicMock(side_effect = [ { 
-        "num_hidden_layers": 16,
-        "vocab_size": 1024,
-        "hidden_size": 16,
-        "intermediate_size": 32,
-    }  ]))
-    def test_rwkv_model(self, mock_file):
-        self.mock_args.model_category = "rwkv"
-        self.mock_args.model = "rwkv-"
-
-        build_model_from_args(self.mock_args)
-
-
-    @patch("builtins.open", new_callable=mock_open, read_data="data")
-    @patch("json.load", MagicMock(side_effect = [ { } ]))
-    def test_chatglm_model(self, mock_file):
-        self.mock_args.model_category = "chatglm"
-        self.mock_args.model = "chatglm2"
-
-        build_model_from_args(self.mock_args)
+if __name__ == "__main__":
+    unittest.main()
